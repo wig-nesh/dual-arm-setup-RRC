@@ -3,10 +3,11 @@ import os
 import sys
 import argparse
 
-# Add project root to path
+# Add project root and current directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from client.src.sam import SAMClient
+from src.sam import SAMClient
 
 
 def main():

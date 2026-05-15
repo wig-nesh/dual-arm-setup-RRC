@@ -17,6 +17,7 @@ This repository contains modular controllers and test scripts for a real-world r
   - `realsense_test.py`: Live viewer and data capture (RGB, Depth, Intrinsics).
 - **`client/`**: Remote inference clients.
   - `src/sam.py`: Client for remote SAM (Segment Anything Model) inference.
+  - `src/model_client.py`: Efficient NPZ-based client for pointcloud model inference (grasps, embeddings, etc.).
   - `webcam_sam_test.py`: Test script to run SAM on a local webcam feed.
 
 ## Hardware & 3D Printing
@@ -49,11 +50,6 @@ The STL files are located in `gripper/3d_printed_parts/`. For a complete gripper
    uv sync
    ```
 
-### SAM Server (External)
-The `SAMClient` requires a remote SAM server to be running. 
-- The server implementation (e.g., using Flask + Ultralytics SAM) must be set up manually on a machine with appropriate GPU support.
-- This repository **does not** manage server-side dependencies (like `ultralytics` or `torch`).
-
 ## Usage
 
 ### xArm Control
@@ -85,10 +81,20 @@ uv run realsense/realsense_test.py
 ### SAM Client Test
 Run interactive segmentation on your webcam feed:
 ```bash
-uv run client/webcam_sam_test.py --url http://YOUR_SERVER_IP:8000 # dualarm@orion.rrcx.tk perhaps
+uv run client/webcam_sam_test.py --url http://dualarm@orion.rrcx.tk:8000
 ```
 - `Left Click`: Select point to segment.
 - `Q`: Quit.
+
+### Grasp Model Client Test
+To run the Grasp Model client, first setup SSH Port Forwarding in a separate terminal:
+```bash
+ssh -L 8000:gnode117:8000 ayushk02@ada.iiit.ac.in
+```
+Then, run the prediction test with interactive Open3D visualization:
+```bash
+uv run client/model_predict_test.py --url http://localhost:8000
+```
 
 ## Data Storage
 Captured data is stored in the `data/` directory (git-ignored), organized by session name:
