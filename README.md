@@ -15,6 +15,18 @@ This repository contains modular controllers and test scripts for a real-world r
   - `src/realsense_camera.py`: RGB-D frame acquisition and alignment.
   - `realsense_test.py`: Live viewer and data capture (RGB, Depth, Intrinsics).
 
+## Hardware & 3D Printing
+
+The gripper used in this project consists of custom 3D printed parts designed for Dynamixel X-series motors.
+
+### Printing Instructions
+The STL files are located in `gripper/3d_printed_parts/`. For a complete gripper, you need to print:
+- **Base** (`base.stl`): The main chassis that mounts to the motor.
+- **Gear** (`gear.stl`): The internal drive gear.
+- **Left Tip** (`left_tip.stl`): The left-side finger.
+- **Right Tip** (`right_tip.stl`): The right-side finger.
+- **Cover** (`cover.stl` or `cover.3mf`): The protective housing.
+
 ## Setup Instructions
 
 ### Prerequisites
