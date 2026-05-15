@@ -8,3 +8,11 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Project Data
+data/
+*.npy
+*.png
+*.json
+!pyproject.toml
+!uv.lock
