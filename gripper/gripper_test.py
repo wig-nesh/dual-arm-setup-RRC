@@ -34,7 +34,7 @@ DXL_MINIMUM_POSITION_VALUE  = 0
 DXL_MAXIMUM_POSITION_VALUE  = 4095
 
 PROTOCOL_VERSION            = 2.0
-DXL_ID                      = 1
+DXL_ID                      = 0
 DEVICENAME                  = '/dev/ttyUSB0'
 BAUDRATE                    = 57600
 
