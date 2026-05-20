@@ -66,13 +66,18 @@ PREGRASP_OFFSET_MM = 100.0
 # Primitive distances in global Z
 LIFT_MM = 100.0
 
-SPEED = 30  # mm/s
+SPEED = 40  # mm/s
 APPROACH_STEPS = 20  # interpolation steps for approach / retreat
 
 POSITION_THRESHOLD_MM = 5.0
 
+# Transform from the saved/model board frame into the robot execution board frame.
+# This must be the single source of truth for both visualization and execution.
+OBJECT_ROTATION_Z_DEG = -90.0
+
 # ── Collision config ───────────────────────────────────────────────────────────
-GRIPPER_LENGTH_MM = 220.0
+GRIPPER_LENGTH_MM = 220.0  # Total length from flange to very tip for collision checks
+FLANGE_TO_MODEL_BASE_MM = 150.0  # Distance from arm flange to the center base of gripper fingers (model output pose)
 TABLE_Z_MM = 0.0
 COLLISION_CLEARANCE_MM = 5.0
 
@@ -93,6 +98,60 @@ def rotation_matrix(roll_deg, pitch_deg, yaw_deg):
     return Rz @ Ry @ Rx
 
 
+def get_T_robot_board_model_board():
+    """
+    Map saved/model board coordinates into the robot board coordinates used for
+    base calibration, visualization, and execution.
+    """
+    R_z = rotation_matrix(0, 0, OBJECT_ROTATION_Z_DEG)
+    T_rot_z = np.eye(4)
+    T_rot_z[:3, :3] = R_z
+
+    T_flip_y = np.eye(4)
+    T_flip_y[1, 1] = -1.0
+
+    return T_flip_y @ T_rot_z
+
+
+def get_T_model_grasp_robot_grasp():
+    """
+    Model grasps use local Y as the approach axis. xArm execution uses local Z.
+    This is a local-frame correction, so it is post-multiplied onto grasp poses.
+    """
+    T = np.eye(4)
+    T[:3, :3] = rotation_matrix(-90, 0, 0)
+    return T
+
+
+def ensure_right_handed_pose(T):
+    """
+    A single-axis board flip mirrors coordinates and can make grasp rotations
+    left-handed. The robot can only execute proper rotations, so preserve the
+    local approach axis (Z) and flip local X if needed.
+    """
+    T_fixed = T.copy()
+    if np.linalg.det(T_fixed[:3, :3]) < 0:
+        T_fixed[:3, 0] *= -1.0
+    return T_fixed
+
+
+def model_grasp_to_robot_board_mm(T_model_board_grasp_scaled):
+    """
+    Convert a saved model grasp into the exact board frame used by robot
+    execution. Input translation is scaled by 8; output translation is mm.
+    """
+    T_model_board_grasp_mm = T_model_board_grasp_scaled.copy()
+    T_model_board_grasp_mm[:3, 3] /= 8.0
+    T_model_board_grasp_mm[:3, 3] *= 1000.0
+
+    T_robot_board_grasp = (
+        get_T_robot_board_model_board()
+        @ T_model_board_grasp_mm
+        @ get_T_model_grasp_robot_grasp()
+    )
+    return ensure_right_handed_pose(T_robot_board_grasp)
+
+
 def matrix_to_pose(T):
     """Convert 4x4 matrix to [x, y, z, roll, pitch, yaw] (mm, degrees)."""
     x, y, z = T[:3, 3]
@@ -109,22 +168,43 @@ def matrix_to_pose(T):
     return [x, y, z, math.degrees(roll), math.degrees(pitch), math.degrees(yaw)]
 
 
+def pose_to_matrix(pose):
+    """Convert [x, y, z, roll, pitch, yaw] back to a 4x4 matrix."""
+    T = np.eye(4)
+    T[:3, :3] = rotation_matrix(pose[3], pose[4], pose[5])
+    T[:3, 3] = pose[:3]
+    return T
+
+
+def assert_pose_round_trip(label, T):
+    pose = matrix_to_pose(T)
+    T_round_trip = pose_to_matrix(pose)
+    pos_err = np.linalg.norm(T[:3, 3] - T_round_trip[:3, 3])
+    rot_err = np.linalg.norm(T[:3, :3] - T_round_trip[:3, :3])
+    if pos_err > 1e-6 or rot_err > 1e-6:
+        raise RuntimeError(
+            f"{label} cannot be represented as an xArm pose "
+            f"(pos_err={pos_err:.6f}mm, rot_err={rot_err:.6f})"
+        )
+    return pose
+
+
 def eef_z_axis(pose):
     R = rotation_matrix(pose[3], pose[4], pose[5])
     return R[:, 2]
 
 
-def compute_flange_pose(tip_pose, gripper_length=GRIPPER_LENGTH_MM):
+def compute_flange_pose(model_pose, offset=FLANGE_TO_MODEL_BASE_MM):
     """
-    The model outputs the grasp pose for the TIP of the gripper.
-    We need to offset this backwards along the local Z axis by the gripper length
-    to find the pose the arm's FLANGE needs to reach.
+    The model outputs the grasp pose for the BASE of the fingers.
+    We need to offset this backwards along the local Z axis by the distance
+    from the flange to the base of the fingers.
     """
-    z_ax = eef_z_axis(tip_pose)
-    flange = list(tip_pose)
-    flange[0] -= z_ax[0] * gripper_length
-    flange[1] -= z_ax[1] * gripper_length
-    flange[2] -= z_ax[2] * gripper_length
+    z_ax = eef_z_axis(model_pose)
+    flange = list(model_pose)
+    flange[0] -= z_ax[0] * offset
+    flange[1] -= z_ax[1] * offset
+    flange[2] -= z_ax[2] * offset
     return flange
 
 
@@ -303,37 +383,94 @@ def execute_grasp_primitive(
 # ── Loading and Setup ──────────────────────────────────────────────────────────
 
 
-def visualize_grasps(run_dir, grasp1_idx, grasp2_idx, all_grasps_scaled):
-    print("Visualizing selected grasps in Open3D...")
+def visualize_scene(
+    run_dir,
+    T_robot_board_model_board,
+    T_board_base7,
+    T_board_base6,
+    T_board_tip7,
+    T_board_flange7,
+    T_board_pre7,
+    T_board_tip6,
+    T_board_flange6,
+    T_board_pre6,
+):
+    print("Visualizing scene in Open3D...")
     pcd_path = os.path.join(run_dir, "pcd_scaled.ply")
     if not os.path.exists(pcd_path):
         print(f"No pointcloud found at {pcd_path}")
         return
 
     pcd = o3d.io.read_point_cloud(pcd_path)
+    # The saved pcd is scaled by 8 (1 unit = 0.125m). We want it in mm.
+    # So 1 unit = 125mm.
+    pcd.scale(125.0, center=(0, 0, 0))
+    pcd.transform(T_robot_board_model_board)
+
     geometries = [pcd]
 
-    base_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0)  # scaled
-    geometries.append(base_frame)
+    board_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=50.0)
+    geometries.append(board_frame)
 
-    # Helper to draw a frame
-    def make_grasp_mesh(T_scaled, color):
-        mesh = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
-        mesh.transform(T_scaled)
-        # Give it a block representing the gripper
-        box = o3d.geometry.TriangleMesh.create_box(width=0.2, height=0.2, depth=0.5)
-        box.translate([-0.1, -0.1, -0.25])
-        box.transform(T_scaled)
-        box.paint_uniform_color(color)
-        return [mesh, box]
+    def make_frame(T, size, color=None):
+        mesh = o3d.geometry.TriangleMesh.create_coordinate_frame(size=size)
+        mesh.transform(T)
+        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=size / 4.0)
+        sphere.transform(T)
+        if color:
+            sphere.paint_uniform_color(color)
+        return [mesh, sphere]
 
-    # Blue for xArm7 (grasp1)
-    geometries.extend(make_grasp_mesh(all_grasps_scaled[grasp1_idx], [0, 0, 1]))
-    # Red for xArm6 (grasp2)
-    geometries.extend(make_grasp_mesh(all_grasps_scaled[grasp2_idx], [1, 0, 0]))
+    def make_line(T1, T2, color):
+        points = [T1[:3, 3], T2[:3, 3]]
+        lines = [[0, 1]]
+        colors = [color]
+        line_set = o3d.geometry.LineSet(
+            points=o3d.utility.Vector3dVector(points),
+            lines=o3d.utility.Vector2iVector(lines),
+        )
+        line_set.colors = o3d.utility.Vector3dVector(colors)
+        return line_set
+
+    # Base 7 (Blue)
+    geometries.extend(make_frame(T_board_base7, size=100.0, color=[0, 0, 1]))
+    # Base 6 (Red)
+    geometries.extend(make_frame(T_board_base6, size=100.0, color=[1, 0, 0]))
+
+    # Grasp 7 & Pre 7 (Blue)
+    geometries.extend(make_frame(T_board_flange7, size=30.0, color=[0, 0, 0.8]))
+    geometries.extend(make_frame(T_board_pre7, size=30.0, color=[0.5, 0.5, 1]))
+    geometries.append(make_line(T_board_pre7, T_board_tip7, [0, 0, 1]))
+
+    # Grasp 6 & Pre 6 (Red)
+    geometries.extend(make_frame(T_board_flange6, size=30.0, color=[0.8, 0, 0]))
+    geometries.extend(make_frame(T_board_pre6, size=30.0, color=[1, 0.5, 0.5]))
+    geometries.append(make_line(T_board_pre6, T_board_tip6, [1, 0, 0]))
+
+    # Camera Frame (if available)
+    marker_path = os.path.join(run_dir, "marker_transform.npy")
+    if os.path.exists(marker_path):
+        # marker_transform maps camera-frame points into the saved board frame:
+        # P_board = T_board_camera @ P_camera. That matrix is already the
+        # camera pose in board coordinates, so do not invert it for drawing.
+        T_board_camera = np.load(marker_path)
+        T_board_camera_mm = T_board_camera.copy()
+        T_board_camera_mm[:3, 3] *= 1000.0
+        T_board_camera_mm = T_robot_board_model_board @ T_board_camera_mm
+        T_board_camera_mm = ensure_right_handed_pose(T_board_camera_mm)
+
+        geometries.extend(
+            make_frame(T_board_camera_mm, size=80.0, color=[0, 1, 0])
+        )  # Green for Camera
+        print("Included Camera Frame (Green) in visualization.")
+    else:
+        print(
+            "No camera transform (marker_transform.npy) found in this run. Run main_pipeline again to save it."
+        )
 
     o3d.visualization.draw_geometries(
-        geometries, window_name="Assigned Grasps (Blue=xArm7, Red=xArm6)"
+        geometries,
+        window_name="Scene Visualization (Blue=xArm7, Red=xArm6, Green=Camera)",
     )
 
 
@@ -341,6 +478,15 @@ def main():
     parser = argparse.ArgumentParser(description="Execute grasps from a run directory")
     parser.add_argument(
         "--run-dir", type=str, required=True, help="Path to run_data directory"
+    )
+    parser.add_argument(
+        "--direct", action="store_true", help="Skip manual mode and execute directly"
+    )
+    parser.add_argument(
+        "--grasp-idx",
+        type=int,
+        default=0,
+        help="Index of the grasp pair to execute (default: 0)",
     )
     args = parser.parse_args()
 
@@ -350,10 +496,17 @@ def main():
         return
 
     data = np.load(npz_path, allow_pickle=True)
-    # Extract the top scoring pair
+    # Extract the requested grasp pair
     if "refined_grasp_pairs" in data and len(data["refined_grasp_pairs"]) > 0:
-        top_pair = data["refined_grasp_pairs"][0]
+        pairs = data["refined_grasp_pairs"]
+        if args.grasp_idx >= len(pairs) or args.grasp_idx < 0:
+            print(
+                f"Error: Requested grasp index {args.grasp_idx} is out of bounds (max {len(pairs) - 1})."
+            )
+            return
+        top_pair = pairs[args.grasp_idx]
         grasps_scaled = [top_pair[0], top_pair[1]]
+        print(f"Using Refined Grasp Pair Index: {args.grasp_idx} out of {len(pairs)}")
     elif "single_grasps" in data and len(data["single_grasps"]) >= 2:
         # Fallback to top 2 single grasps if no pairs exist
         grasps_scaled = [data["single_grasps"][0], data["single_grasps"][1]]
@@ -363,14 +516,11 @@ def main():
 
     grasps_scaled = np.array(grasps_scaled)
 
-    # 1. Convert to board frame in mm
+    # 1. Convert to the robot board frame in mm.
+    T_robot_board_model_board = get_T_robot_board_model_board()
     grasps_board_mm = []
     for g in grasps_scaled:
-        g_board_m = g.copy()
-        g_board_m[:3, 3] /= 8.0
-        g_board_mm = g_board_m.copy()
-        g_board_mm[:3, 3] *= 1000.0
-        grasps_board_mm.append(g_board_mm)
+        grasps_board_mm.append(model_grasp_to_robot_board_mm(g))
 
     # 2. Assign based on distance to base
     T_base7_board = get_T_base_board(XARM7_BASE_TO_BOARD_X, XARM7_BASE_TO_BOARD_Y)
@@ -398,21 +548,79 @@ def main():
     print(f"Assigned Grasp {idx_7} to xArm7 (Blue, {IP1}) - Dist: {dist_7:.1f}mm")
     print(f"Assigned Grasp {idx_6} to xArm6 (Red, {IP2}) - Dist: {dist_6:.1f}mm")
 
-    # 3. Visualize
-    visualize_grasps(args.run_dir, idx_7, idx_6, grasps_scaled)
+    # 3. Compute all grasp transformations in the robot board frame.
+    T_model_to_flange = np.eye(4)
+    T_model_to_flange[2, 3] = -FLANGE_TO_MODEL_BASE_MM
+    T_flange_to_pre = np.eye(4)
+    T_flange_to_pre[2, 3] = -PREGRASP_OFFSET_MM
 
-    # 4. Generate the exact base poses
-    T_base7_grasp_tip = T_base7_board @ grasps_board_mm[idx_7]
-    T_base6_grasp_tip = T_base6_board @ grasps_board_mm[idx_6]
+    T_board_model7 = grasps_board_mm[idx_7]
+    T_board_model6 = grasps_board_mm[idx_6]
 
-    grasp1_tip = matrix_to_pose(T_base7_grasp_tip)
-    grasp2_tip = matrix_to_pose(T_base6_grasp_tip)
+    # Apply a rotation around the local Z (approach) axis to correct final "roll"
+    # Note: Since model approach was Y, and we mapped it to Z via R_local_corr,
+    # the approach axis is now Z in this local frame.
 
-    grasp1 = compute_flange_pose(grasp1_tip)
-    grasp2 = compute_flange_pose(grasp2_tip)
+    # Arm-specific roll correction around local approach Z.
+    R_approach_ax7 = np.eye(4)
+    R_approach_ax7[:3, :3] = rotation_matrix(0, 0, 90.0)
+    T_board_model7 = T_board_model7 @ R_approach_ax7
 
-    pre1 = compute_pregrasp(grasp1)
-    pre2 = compute_pregrasp(grasp2)
+    R_approach_ax6 = np.eye(4)
+    R_approach_ax6[:3, :3] = rotation_matrix(0, 0, 90.0)
+    T_board_model6 = T_board_model6 @ R_approach_ax6
+
+    T_board_flange7 = T_board_model7 @ T_model_to_flange
+    T_board_pre7 = T_board_flange7 @ T_flange_to_pre
+
+    T_board_flange6 = T_board_model6 @ T_model_to_flange
+    T_board_pre6 = T_board_flange6 @ T_flange_to_pre
+
+    # 4. Generate the exact base poses for execution.
+    T_base7_flange = T_base7_board @ T_board_flange7
+    T_base7_pre = T_base7_board @ T_board_pre7
+    T_base6_flange = T_base6_board @ T_board_flange6
+    T_base6_pre = T_base6_board @ T_board_pre6
+
+    # 5. Reconstruct the visualization frames from the execution frames. This
+    # makes Open3D show exactly what the xArm commands below will request.
+    T_board_base7 = np.linalg.inv(T_base7_board)
+    T_board_base6 = np.linalg.inv(T_base6_board)
+
+    T_vis_flange7 = T_board_base7 @ T_base7_flange
+    T_vis_pre7 = T_board_base7 @ T_base7_pre
+    T_vis_flange6 = T_board_base6 @ T_base6_flange
+    T_vis_pre6 = T_board_base6 @ T_base6_pre
+
+    for label, expected, actual in [
+        ("Arm1 flange", T_board_flange7, T_vis_flange7),
+        ("Arm1 pregrasp", T_board_pre7, T_vis_pre7),
+        ("Arm2 flange", T_board_flange6, T_vis_flange6),
+        ("Arm2 pregrasp", T_board_pre6, T_vis_pre6),
+    ]:
+        if not np.allclose(expected, actual, atol=1e-6):
+            delta = np.linalg.norm(expected[:3, 3] - actual[:3, 3])
+            raise RuntimeError(
+                f"{label} visualization/execution mismatch: {delta:.6f}mm"
+            )
+
+    visualize_scene(
+        args.run_dir,
+        T_robot_board_model_board,
+        T_board_base7,
+        T_board_base6,
+        T_board_model7,
+        T_vis_flange7,
+        T_vis_pre7,
+        T_board_model6,
+        T_vis_flange6,
+        T_vis_pre6,
+    )
+
+    grasp1 = assert_pose_round_trip("Arm1 grasp", T_base7_flange)
+    pre1 = assert_pose_round_trip("Arm1 pregrasp", T_base7_pre)
+    grasp2 = assert_pose_round_trip("Arm2 grasp", T_base6_flange)
+    pre2 = assert_pose_round_trip("Arm2 pregrasp", T_base6_pre)
 
     for label, pose in [
         ("Arm1 grasp", grasp1),

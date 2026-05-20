@@ -573,6 +573,28 @@ def main():
         if key == ord(" "):
             break
 
+    print("Refreshing ArUco pose on final RGBD capture...")
+    success, refreshed_marker_transform, num_markers = camera.detect_aruco_markers(
+        color_frame, MARKER_WORLD, MARKER_LENGTH
+    )
+    if success:
+        marker_transform = refreshed_marker_transform
+        print(f"Updated marker pose using {num_markers} markers.")
+        print(f"Translation: {marker_transform[:3, 3]}")
+    else:
+        if marker_transform is not None:
+            print(
+                f"Could not refresh marker pose on final capture ({num_markers} markers). "
+                "Using earlier marker pose."
+            )
+        elif num_markers > 0:
+            print(
+                f"Only {num_markers} markers detected on final capture. "
+                "Using camera frame (no transform)."
+            )
+        else:
+            print("No markers detected on final capture. Using camera frame (no transform).")
+
     camera.stop()
     cv2.destroyAllWindows()
 
@@ -736,6 +758,10 @@ def main():
     # Save pointcloud
     print("Saving processed pointcloud...")
     o3d.io.write_point_cloud(os.path.join(run_dir, "pcd_scaled.ply"), pcd)
+
+    # Save marker transform if available
+    if marker_transform is not None:
+        np.save(os.path.join(run_dir, "marker_transform.npy"), marker_transform)
 
     # Add coordinate frame at origin (board center after points transformed to world frame)
     world_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.15)
